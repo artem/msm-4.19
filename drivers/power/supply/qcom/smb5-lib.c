@@ -1303,6 +1303,9 @@ static void smblib_uusb_removal(struct smb_charger *chg)
 	vote(chg->usb_icl_votable, SW_QC3_VOTER, false, 0);
 	vote(chg->usb_icl_votable, HVDCP2_ICL_VOTER, false, 0);
 	vote(chg->usb_icl_votable, CHG_TERMINATION_VOTER, false, 0);
+#if defined(CONFIG_SOMC_CHARGER_EXTENSION)
+	vote(chg->dc_suspend_votable, CHG_TERMINATION_VOTER, false, 0);
+#endif
 	vote(chg->usb_icl_votable, THERMAL_THROTTLE_VOTER, false, 0);
 	vote(chg->limited_irq_disable_votable, CHARGER_TYPE_VOTER,
 			true, 0);
@@ -6616,6 +6619,9 @@ static void typec_src_removal(struct smb_charger *chg)
 	vote(chg->usb_icl_votable, CTM_VOTER, false, 0);
 	vote(chg->usb_icl_votable, HVDCP2_ICL_VOTER, false, 0);
 	vote(chg->usb_icl_votable, CHG_TERMINATION_VOTER, false, 0);
+#if defined(CONFIG_SOMC_CHARGER_EXTENSION)
+	vote(chg->dc_suspend_votable, CHG_TERMINATION_VOTER, false, 0);
+#endif
 	vote(chg->usb_icl_votable, THERMAL_THROTTLE_VOTER, false, 0);
 	vote(chg->usb_icl_votable, LPD_VOTER, false, 0);
 
@@ -7473,6 +7479,11 @@ irqreturn_t dc_plugin_irq_handler(int irq, void *data)
 	dc_present = input_present & INPUT_PRESENT_DC;
 	usb_present = input_present & INPUT_PRESENT_USB;
 
+	if (!dc_present) {
+		vote(chg->usb_icl_votable, CHG_TERMINATION_VOTER, false, 0);
+		vote(chg->dc_suspend_votable, CHG_TERMINATION_VOTER, false, 0);
+	}
+
 	if (!dc_present && !usb_present) {
 		__pm_wakeup_event(&chg->unplug_wakelock,
 						UNPLUG_WAKE_PERIOD);
@@ -8095,15 +8106,16 @@ static enum alarmtimer_restart moisture_protection_alarm_cb(struct alarm *alarm,
 	return ALARMTIMER_NORESTART;
 }
 
+#if defined(CONFIG_SOMC_CHARGER_EXTENSION)
+#define CC_SOC_TO_ENTRY_CP 75
+#define CC_SOC_TO_EXIT_CP 50
+#endif
 static void smblib_chg_termination_work(struct work_struct *work)
 {
 	union power_supply_propval pval;
 	struct smb_charger *chg = container_of(work, struct smb_charger,
 						chg_termination_work);
 	int rc, input_present, delay = CHG_TERM_WA_ENTRY_DELAY_MS;
-#if defined(CONFIG_SOMC_CHARGER_EXTENSION)
-	int cc_soc_to_entry, cc_soc_to_exit;
-#endif
 
 	/*
 	 * Hold awake votable to prevent pm_relax being called prior to
@@ -8193,16 +8205,14 @@ static void smblib_chg_termination_work(struct work_struct *work)
 			pval.intval, chg->cc_soc_ref, delay);
 #endif
 #if defined(CONFIG_SOMC_CHARGER_EXTENSION)
-	cc_soc_to_entry = div64_s64((int64_t)chg->cc_soc_ref * 10075, 10000);
-	cc_soc_to_exit = div64_s64((int64_t)chg->cc_soc_ref * 10050, 10000);
 	smblib_dbg(chg, PR_SOMC, "cc_soc: %d, cc_soc_ref: %d\n",
 						pval.intval, chg->cc_soc_ref);
-	if (pval.intval > cc_soc_to_entry) {
+	if (pval.intval > chg->cc_soc_ref + CC_SOC_TO_ENTRY_CP) {
 		smblib_dbg(chg, PR_SOMC, "Enable Termination WA due to dececting over current !!\n");
 		vote(chg->usb_icl_votable, CHG_TERMINATION_VOTER, true, 0);
 		vote(chg->dc_suspend_votable, CHG_TERMINATION_VOTER, true, 0);
 		delay = CHG_TERM_WA_EXIT_DELAY_MS;
-	} else if (pval.intval < cc_soc_to_exit) {
+	} else if (pval.intval < chg->cc_soc_ref + CC_SOC_TO_EXIT_CP) {
 		smblib_dbg(chg, PR_SOMC, "Disable Termination WA\n");
 		vote(chg->usb_icl_votable, CHG_TERMINATION_VOTER, false, 0);
 		vote(chg->dc_suspend_votable, CHG_TERMINATION_VOTER, false, 0);
@@ -9382,6 +9392,17 @@ void smblib_somc_handle_jeita_step_fv(struct smb_charger *chg, int val)
 
 void smblib_somc_handle_profile_fv(struct smb_charger *chg, int val)
 {
+	/* Cancel termination WA */
+	if (chg->wa_flags & CHG_TERMINATION_WA) {
+		alarm_cancel(&chg->chg_termination_alarm);
+		cancel_work_sync(&chg->chg_termination_work);
+		vote(chg->awake_votable, CHG_TERMINATION_VOTER, false, 0);
+
+		chg->cc_soc_ref = 0;
+		chg->last_cc_soc = 0;
+		smblib_dbg(chg, PR_SOMC, "cancel termination wa if working\n");
+	}
+
 	smblib_dbg(chg, PR_SOMC, "set fv:%d\n", val);
 	vote(chg->fv_votable, BATT_PROFILE_VOTER, true, val);
 

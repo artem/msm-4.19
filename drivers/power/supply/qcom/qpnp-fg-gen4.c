@@ -844,11 +844,40 @@ static int fg_gen4_get_charge_counter_shadow(struct fg_gen4_chip *chip,
 	return 0;
 }
 
+#if defined(CONFIG_SOMC_CHARGER_EXTENSION)
+#define SRAM_BATT_TEMP_UPDATE_TIME_THRESH_MS 3000
+#endif
 static int fg_gen4_get_battery_temp(struct fg_dev *fg, int *val)
 {
 	int rc = 0;
 	u16 buf;
+#if defined(CONFIG_SOMC_CHARGER_EXTENSION)
+	s64 current_ktime_ms, ktime_diff_ms;
 
+	current_ktime_ms = ktime_to_ms(ktime_get_boottime());
+	ktime_diff_ms = current_ktime_ms - fg->last_update_batt_temp_ktime_ms;
+
+	if (ktime_diff_ms >= 0 &&
+		ktime_diff_ms < SRAM_BATT_TEMP_UPDATE_TIME_THRESH_MS) {
+		*val = fg->last_update_batt_temp;
+		fg_dbg(fg, FG_STATUS, "Skip to read batt_temp from sram to use last data(%d)\n",
+									*val);
+	} else {
+		rc = fg_sram_read(fg, BATT_TEMP_WORD, BATT_TEMP_OFFSET,
+					(u8 *)&buf, 2, FG_IMA_DEFAULT);
+		if (rc < 0) {
+			pr_err("Failed to read BATT_TEMP_WORD rc=%d\n", rc);
+			return rc;
+		}
+		*val = sign_extend32(buf, 9) * 100 / 40;
+
+		fg->last_update_batt_temp_ktime_ms = current_ktime_ms;
+		fg->last_update_batt_temp = *val;
+		fg_dbg(fg, FG_STATUS, "Read batt_temp(%d) from sram since enough time has passed\n",
+									*val);
+	}
+#endif
+#if !defined(CONFIG_SOMC_CHARGER_EXTENSION)
 	rc = fg_sram_read(fg, BATT_TEMP_WORD, BATT_TEMP_OFFSET, (u8 *)&buf,
 			2, FG_IMA_DEFAULT);
 	if (rc < 0) {
@@ -861,6 +890,7 @@ static int fg_gen4_get_battery_temp(struct fg_dev *fg, int *val)
 	 * 0.25 C. Multiply by 10 to convert it to deci degrees C.
 	 */
 	*val = sign_extend32(buf, 9) * 100 / 40;
+#endif
 
 	return 0;
 }
@@ -881,23 +911,21 @@ static int fg_gen4_somc_get_real_temp(struct fg_dev *fg, int *val)
 		return 0;
 	}
 
-	rc = fg_gen4_get_battery_temp(fg, &batt_temp);
-	if (rc < 0) {
-		pr_err("failed to read batt_temp rc=%d\n", rc);
-		return rc;
-	}
-
 	if (fg->temp_corr_en) {
 		if (fg->cell_temp_avtive) {
 			*val = fg->cell_temp;
 			fg_dbg(fg, FG_TEMP_CORR, "batt:%d -> real battery temp:%d\n",
 							batt_temp, *val);
+			return 0;
 		} else {
-			*val = batt_temp;
-			fg_dbg(fg, FG_TEMP_CORR, "cell_temp is not active yet. batt:%d\n",
-								batt_temp);
+			fg_dbg(fg, FG_TEMP_CORR, "cell_temp is not active yet. So use batt_temp or mixed temp.\n");
 		}
-		return 0;
+	}
+
+	rc = fg_gen4_get_battery_temp(fg, &batt_temp);
+	if (rc < 0) {
+		pr_err("failed to read batt_temp rc=%d\n", rc);
+		return rc;
 	}
 
 	if (fg->use_real_temp) {
@@ -905,7 +933,7 @@ static int fg_gen4_somc_get_real_temp(struct fg_dev *fg, int *val)
 	} else {
 		*val = batt_temp;
 		fg_dbg(fg, FG_STATUS,
-			"Real Temp is not supported. So, batt_temp is used\n");
+			"Real Temp(mixed temp) is not supported. So, batt_temp is used\n");
 		return 0;
 	}
 
@@ -926,7 +954,7 @@ static int fg_gen4_somc_get_real_temp(struct fg_dev *fg, int *val)
 	}
 
 	*val = max(corrected_batt_temp, corrected_aux_temp);
-	fg_dbg(fg, FG_STATUS, "batt:%d aux:%d -> real battery temp:%d\n",
+	fg_dbg(fg, FG_STATUS, "batt:%d aux:%d -> real battery temp(mixed temp):%d\n",
 						batt_temp, aux_temp, *val);
 	return 0;
 }
@@ -957,17 +985,23 @@ static int fg_gen4_tz_get_temp(void *data, int *temperature)
 	if (!temperature)
 		return -EINVAL;
 
+#if !defined(CONFIG_SOMC_CHARGER_EXTENSION)
 	rc = fg_gen4_get_battery_temp(fg, &temp);
 	if (rc < 0)
 		return rc;
-
+#endif
 #if defined(CONFIG_SOMC_CHARGER_EXTENSION)
 	if (fg->use_real_temp) {
 		rc = fg_gen4_somc_get_real_temp(fg, &temp);
 		if (rc < 0)
 			return rc;
+	} else {
+		rc = fg_gen4_get_battery_temp(fg, &temp);
+		if (rc < 0)
+			return rc;
 	}
 #endif
+
 	/* Convert deciDegC to milliDegC */
 	*temperature = temp * 100;
 	return rc;

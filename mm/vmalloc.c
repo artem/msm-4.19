@@ -332,7 +332,6 @@ static DEFINE_SPINLOCK(vmap_area_lock);
 static DEFINE_SPINLOCK(free_vmap_area_lock);
 /* Export for kexec only */
 LIST_HEAD(vmap_area_list);
-static LLIST_HEAD(vmap_purge_list);
 static struct rb_root vmap_area_root = RB_ROOT;
 static bool vmap_initialized __read_mostly;
 
@@ -368,6 +367,10 @@ static struct rb_root free_vmap_area_root = RB_ROOT;
  * to use more permissive allocation masks.
  */
 static DEFINE_PER_CPU(struct vmap_area *, ne_fit_preload_node);
+
+static struct rb_root purge_vmap_area_root = RB_ROOT;
+static LIST_HEAD(purge_vmap_area_list);
+static DEFINE_SPINLOCK(purge_vmap_area_lock);
 
 static __always_inline unsigned long
 va_size(struct vmap_area *va)
@@ -735,7 +738,8 @@ insert_vmap_area_augment(struct vmap_area *va,
  */
 static __always_inline void
 merge_or_add_vmap_area(struct vmap_area *va,
-	struct rb_root *root, struct list_head *head)
+	struct rb_root *root, struct list_head *head,
+	bool tree_update)
 {
 	struct vmap_area *sibling;
 	struct list_head *next;
@@ -768,9 +772,6 @@ merge_or_add_vmap_area(struct vmap_area *va,
 		if (sibling->va_start == va->va_end) {
 			sibling->va_start = va->va_start;
 
-			/* Check and update the tree if needed. */
-			augment_tree_propagate_from(sibling);
-
 			/* Free vmap_area object. */
 			kmem_cache_free(vmap_area_cachep, va);
 
@@ -790,25 +791,32 @@ merge_or_add_vmap_area(struct vmap_area *va,
 	if (next->prev != head) {
 		sibling = list_entry(next->prev, struct vmap_area, list);
 		if (sibling->va_end == va->va_start) {
-			sibling->va_end = va->va_end;
-
-			/* Check and update the tree if needed. */
-			augment_tree_propagate_from(sibling);
-
+			/*
+			 * Please note about important sequence if both neighbors
+			 * are coalesced. It is principal to unlink the "next" node
+			 * before merging with "previous" one. Otherwise the tree
+			 * might not be fully populated if next->parent gets rotated.
+			 */
 			if (merged)
 				unlink_va(va, root);
 
+			sibling->va_end = va->va_end;
+
 			/* Free vmap_area object. */
 			kmem_cache_free(vmap_area_cachep, va);
-			return;
+
+			/* Point to the new merged area. */
+			va = sibling;
+			merged = true;
 		}
 	}
 
 insert:
-	if (!merged) {
+	if (!merged)
 		link_va(va, root, parent, link, head);
+
+	if (tree_update)
 		augment_tree_propagate_from(va);
-	}
 }
 
 static __always_inline bool
@@ -1247,7 +1255,7 @@ static void free_vmap_area(struct vmap_area *va)
 	 */
 	spin_lock(&free_vmap_area_lock);
 	merge_or_add_vmap_area(va,
-		&free_vmap_area_root, &free_vmap_area_list);
+		&free_vmap_area_root, &free_vmap_area_list, true);
 	spin_unlock(&free_vmap_area_lock);
 }
 
@@ -1311,32 +1319,32 @@ void set_iounmap_nonlazy(void)
 static bool __purge_vmap_area_lazy(unsigned long start, unsigned long end)
 {
 	unsigned long resched_threshold;
-	struct llist_node *valist;
-	struct vmap_area *va;
-	struct vmap_area *n_va;
+	struct list_head local_purge_list;
+	struct vmap_area *va, *n_va;
 
 	lockdep_assert_held(&vmap_purge_lock);
 
-	valist = llist_del_all(&vmap_purge_list);
-	if (unlikely(valist == NULL))
+	spin_lock(&purge_vmap_area_lock);
+	purge_vmap_area_root = RB_ROOT;
+	list_replace_init(&purge_vmap_area_list, &local_purge_list);
+	spin_unlock(&purge_vmap_area_lock);
+
+	if (unlikely(list_empty(&local_purge_list)))
 		return false;
 
-	/*
-	 * TODO: to calculate a flush range without looping.
-	 * The list can be up to lazy_max_pages() elements.
-	 */
-	llist_for_each_entry(va, valist, purge_list) {
-		if (va->va_start < start)
-			start = va->va_start;
-		if (va->va_end > end)
-			end = va->va_end;
-	}
+	start = min(start,
+		list_first_entry(&local_purge_list,
+			struct vmap_area, list)->va_start);
+
+	end = max(end,
+		list_last_entry(&local_purge_list,
+			struct vmap_area, list)->va_end);
 
 	flush_tlb_kernel_range(start, end);
 	resched_threshold = lazy_max_pages() << 1;
 
 	spin_lock(&free_vmap_area_lock);
-	llist_for_each_entry_safe(va, n_va, valist, purge_list) {
+	list_for_each_entry_safe(va, n_va, &local_purge_list, list) {
 		unsigned long nr = (va->va_end - va->va_start) >> PAGE_SHIFT;
 
 		/*
@@ -1345,7 +1353,7 @@ static bool __purge_vmap_area_lazy(unsigned long start, unsigned long end)
 		 * anything.
 		 */
 		merge_or_add_vmap_area(va,
-			&free_vmap_area_root, &free_vmap_area_list);
+			&free_vmap_area_root, &free_vmap_area_list, true);
 
 		atomic_long_sub(nr, &vmap_lazy_nr);
 
@@ -1396,7 +1404,20 @@ static void free_vmap_area_noflush(struct vmap_area *va)
 				PAGE_SHIFT, &vmap_lazy_nr);
 
 	/* After this point, we may free va at any time */
-	llist_add(&va->purge_list, &vmap_purge_list);
+	spin_lock(&purge_vmap_area_lock);
+
+	/*
+	 * Do not update the subtree_max_size of the node
+	 * during merging operation. So we do not need to
+	 * adjust the augmented value, because this tree
+	 * contains unpurged areas only and is transition
+	 * one. Later when this tree is merged with final
+	 * one that represents the "free space" and is
+	 * augmented, the subtree_max_size will be fixed.
+	 */
+	merge_or_add_vmap_area(va,
+		&purge_vmap_area_root, &purge_vmap_area_list, false);
+	spin_unlock(&purge_vmap_area_lock);
 
 	if (unlikely(nr_lazy > lazy_max_pages()))
 		try_purge_vmap_area_lazy();
@@ -3396,7 +3417,7 @@ recovery:
 	 */
 	while (area--) {
 		merge_or_add_vmap_area(vas[area],
-			&free_vmap_area_root, &free_vmap_area_list);
+			&free_vmap_area_root, &free_vmap_area_list, true);
 		vas[area] = NULL;
 	}
 
@@ -3500,18 +3521,15 @@ static void show_numa_info(struct seq_file *m, struct vm_struct *v)
 
 static void show_purge_info(struct seq_file *m)
 {
-	struct llist_node *head;
 	struct vmap_area *va;
 
-	head = READ_ONCE(vmap_purge_list.first);
-	if (head == NULL)
-		return;
-
-	llist_for_each_entry(va, head, purge_list) {
+	spin_lock(&purge_vmap_area_lock);
+	list_for_each_entry(va, &purge_vmap_area_list, list) {
 		seq_printf(m, "0x%pK-0x%pK %7ld unpurged vm_area\n",
 			(void *)va->va_start, (void *)va->va_end,
 			va->va_end - va->va_start);
 	}
+	spin_unlock(&purge_vmap_area_lock);
 }
 
 static int s_show(struct seq_file *m, void *p)

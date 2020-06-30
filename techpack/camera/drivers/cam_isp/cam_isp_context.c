@@ -2874,7 +2874,13 @@ static struct cam_isp_ctx_irq_ops
 		.irq_ops = {
 			__cam_isp_ctx_handle_error,
 			__cam_isp_ctx_rdi_only_sof_in_top_state,
+/* sony extension begin */
+#if 1
+			__cam_isp_ctx_rdi_only_reg_upd_in_bubble_applied_state,
+#else
 			NULL,
+#endif
+/* sony extension end */
 			NULL,
 			NULL,
 			__cam_isp_ctx_buf_done_in_epoch,
@@ -2885,7 +2891,13 @@ static struct cam_isp_ctx_irq_ops
 		.irq_ops = {
 			__cam_isp_ctx_handle_error,
 			__cam_isp_ctx_rdi_only_sof_in_bubble_state,
+/* sony extension begin */
+#if 1
+			__cam_isp_ctx_rdi_only_reg_upd_in_bubble_applied_state,
+#else
 			NULL,
+#endif
+/* sony extension end */
 			NULL,
 			NULL,
 			__cam_isp_ctx_buf_done_in_bubble,

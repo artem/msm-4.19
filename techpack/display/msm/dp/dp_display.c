@@ -229,7 +229,6 @@ static ssize_t dp_display_dp_stop_store(struct device *dev,
 {
 	struct dp_display_private *dp;
 	u32 mode_bit = 0, bit_pos, bit_val;
-	bool hpd_enable;
 
 	if (dev == NULL) {
 		pr_err("invalid dev\n");
@@ -253,12 +252,8 @@ static ssize_t dp_display_dp_stop_store(struct device *dev,
 	dp->dp_stop_state &= ~(BIT(bit_pos));
 	dp->dp_stop_state |= bit_val;
 
-	hpd_enable = (dp->dp_stop_state) ? false : true;
-	dp->hpd->simulate_connect(dp->hpd, hpd_enable);
-
 	/* Set/Clear minimum PD src caps by Thermal client */
-	if (bit_pos == 0)
-		dp_usbpd_set_min_src_caps(dp->hpd, !!bit_val);
+	dp_usbpd_set_min_src_caps(dp->hpd, !!bit_val);
 
 	return count;
 }
@@ -1207,7 +1202,8 @@ static int dp_display_usbpd_configure_cb(struct device *dev)
 #ifdef CONFIG_DRM_SDE_SPECIFIC_PANEL
 	/* check for stop_state */
 	if (dp->dp_stop_state) {
-		pr_info("dp is stopped (state=%08x)\n", dp->dp_stop_state);
+		pr_info("dp is stopped (state=%08x), skip dp_display_usbpd_configure\n",
+							dp->dp_stop_state);
 		goto end;
 	}
 #endif /* CONFIG_DRM_SDE_SPECIFIC_PANEL */
@@ -1531,6 +1527,15 @@ static int dp_display_usbpd_attention_cb(struct device *dev)
 		DP_ERR("no driver data found\n");
 		return -ENODEV;
 	}
+
+#ifdef CONFIG_DRM_SDE_SPECIFIC_PANEL
+	/* check for stop_state */
+	if (dp->dp_stop_state) {
+		pr_info("dp is stopped (state=%08x), skip dp_display_usbpd_attention\n",
+							dp->dp_stop_state);
+		return 0;
+	}
+#endif /* CONFIG_DRM_SDE_SPECIFIC_PANEL */
 
 	DP_DEBUG("hpd_irq:%d, hpd_high:%d, power_on:%d, is_connected:%d\n",
 			dp->hpd->hpd_irq, dp->hpd->hpd_high,

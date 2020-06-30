@@ -1820,7 +1820,8 @@ void dsi_panel_driver_oled_short_check_worker(struct work_struct *work)
 	}
 	short_det->short_check_working = true;
 
-	dsi_panel_driver_oled_short_det_disable(spec_pdata);
+	if (short_det->current_chatter_cnt == SHORT_CHATTER_CNT_START)
+		dsi_panel_driver_oled_short_det_disable(spec_pdata);
 
 	/* status check */
 	rc = gpio_get_value(spec_pdata->disp_err_fg_gpio);
@@ -1839,13 +1840,18 @@ void dsi_panel_driver_oled_short_check_worker(struct work_struct *work)
 			}
 			return;
 		}
-	}
 
+		short_det->short_check_working = false;
+		schedule_delayed_work(&short_det->check_work,
+			msecs_to_jiffies(short_det->target_chatter_check_interval));
+		return;
+	}
 	dsi_panel_driver_oled_short_det_enable(spec_pdata, SHORT_WORKER_ACTIVE);
 
-	pr_debug("%s: short_check_worker done.\n", __func__);
+	/* reset count*/
+	short_det->current_chatter_cnt = 0;
 	short_det->short_check_working = false;
-	schedule_delayed_work(&short_det->check_work,
-		msecs_to_jiffies(short_det->target_chatter_check_interval));
+
+	pr_debug("%s: short_check_worker done.\n", __func__);
 	return;
 }

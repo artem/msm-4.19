@@ -592,6 +592,9 @@ struct fg_dev {
 	/* Soc Correction */
 	int			msoc_tune_a;
 	int			msoc_tune_b;
+	/* etc */
+	s64			last_update_batt_temp_ktime_ms;
+	int			last_update_batt_temp;
 #endif
 };
 

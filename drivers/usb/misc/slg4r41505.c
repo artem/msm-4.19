@@ -457,7 +457,6 @@ static void wdet_check_water_work(struct work_struct *w)
 
 exit_work:
 	mutex_unlock(&wdet->wdet_mutex);
-	__pm_relax(&wdet->check_lock);
 }
 
 static void wdet_check_connect_work(struct work_struct *w)

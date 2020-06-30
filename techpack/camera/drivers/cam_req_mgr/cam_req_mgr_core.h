@@ -38,7 +38,13 @@
 
 #define SYNC_LINK_SOF_CNT_MAX_LMT 1
 
+/* sony extension begin */
+#if 1
+#define MAXIMUM_LINKS_PER_SESSION  5
+#else
 #define MAXIMUM_LINKS_PER_SESSION  4
+#endif
+/* sony extension end */
 
 #define MAXIMUM_RETRY_ATTEMPTS 3
 
